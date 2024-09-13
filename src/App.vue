@@ -1,7 +1,7 @@
 <template>
     <div class="min-h-screen bg-gray-100 flex flex-col items-center justify-center p-6">
         <h1 class="text-3xl font-bold mb-2">
-            Background Removal w/
+            Background Removal with
             <a href="http://github.com/xenova/transformers.js" target="_blank" class="text-blue-600 hover:underline"
                 >🤗 Transformers.js</a
             >
@@ -72,15 +72,18 @@ onMounted(async () => {
 
     // Proxy the WASM backend to prevent the UI from freezing
     env.backends.onnx.wasm.proxy = true;
+    env.useBrowserCache = false;
 
     // Load model and processor
-    env.localModelPath = '/onnx/RMBG-1.4';
+    env.localModelPath = '/models/';
+    env.backends.onnx.wasm.wasmPaths='/public/'
 
-    model = await AutoModel.from_pretrained('briaai/RMBG-1.4', {
+
+    model = await AutoModel.from_pretrained('RMBG-1.4', {
         config: { model_type: 'custom' }
     });
 
-    processor = await AutoProcessor.from_pretrained('briaai/RMBG-1.4', {
+    processor = await AutoProcessor.from_pretrained('RMBG-1.4', {
         config: {
             do_normalize: true,
             do_pad: false,
