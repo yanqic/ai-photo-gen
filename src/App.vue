@@ -30,8 +30,8 @@
                     <!-- 图片预览部分 -->
                     <div
                         v-if="imageUrl"
-                        class="relative w-full h-[480px] border-2 border-gray-300 rounded-xl overflow-hidden mb-4">
-                        <img :src="imageUrl" class="w-full h-full object-cover" />
+                        class="relative w-full flex justify-center items-center h-[480px] border-2 border-gray-300 rounded-xl overflow-hidden mb-4">
+                        <img :src="imageUrl" class="h-full object-contain" />
                         <button
                             @click="replaceImage"
                             class="absolute top-2 right-2 flex items-center justify-center w-6 h-6 bg-gray-200 rounded-full hover:bg-gray-300 focus:outline-none">
@@ -71,8 +71,8 @@
                     <h5 class="text-2xl font-bold mb-4">Processed Image Preview</h5>
                     <div
                         id="container"
-                        class="relative w-full h-[480px] border-2 border-dashed border-gray-300 rounded-xl overflow-hidden mb-4">
-                        <canvas ref="canvas" v-if="imageUrl" class="absolute inset-0 w-full h-full"></canvas>
+                        class="relative flex justify-center items-center w-full h-[480px] border-2 border-dashed border-gray-300 rounded-xl overflow-hidden mb-4">
+                        <canvas ref="canvasRef" v-if="imageUrl" class="inset-0 object-contain h-full"></canvas>
                     </div>
                 </div>
             </div>
@@ -81,40 +81,25 @@
 </template>
 
 <script setup>
-import { ref, onMounted, computed } from 'vue';
-import { AutoModel, AutoProcessor, env, RawImage } from '@xenova/transformers';
+import { ref, onMounted } from 'vue';
+import ort from 'onnxruntime-web';
 
 // Refs
 const status = ref('Loading model...');
-const canvas = ref(null);
+const ref_size = 512;
+const canvasRef = ref(null);
 const param1 = ref('');
 const param2 = ref('');
 const imageUrl = ref('');
 
 // Model and processor
-let model, processor;
+let session;
 
 onMounted(async () => {
-    env.allowLocalModels = true;
-    env.useBrowserCache = false;
-
-    model = await AutoModel.from_pretrained('RMBG-1.4', {
-        config: { model_type: 'custom' }
-    });
-
-    processor = await AutoProcessor.from_pretrained('RMBG-1.4', {
-        config: {
-            do_normalize: true,
-            do_pad: false,
-            do_rescale: true,
-            do_resize: true,
-            image_mean: [0.5, 0.5, 0.5],
-            image_std: [1, 1, 1],
-            resample: 2,
-            rescale_factor: 0.00392156862745098,
-            size: { width: 1024, height: 1024 }
-        }
-    });
+    const modelFilepath = '/models/modnet.onnx';
+    const response = await fetch(modelFilepath);
+    const modelFile = await response.arrayBuffer();
+    session = await ort.InferenceSession.create(modelFile);
 
     status.value = 'Ready';
 });
@@ -132,7 +117,7 @@ const onFileChange = (e) => {
 
 const replaceImage = () => {
     imageUrl.value = ''; // 清空图片预览
-    canvas.value.getContext('2d').clearRect(0, 0, canvas.value.width, canvas.value.height); // 清除 canvas
+    canvasRef.value.getContext('2d').clearRect(0, 0, canvasRef.value.width, canvasRef.value.height); // 清除 canvas
     document.getElementById('upload').value = ''; // 重置文件输入框
     status.value = 'Ready for new upload';
 };
@@ -143,28 +128,106 @@ const onSubmit = () => {
     predict(imageUrl.value);
 };
 
-const predict = async (url) => {
-    const image = await RawImage.fromURL(url);
-    imageUrl.value = url;
+function getScaleFactor(im_h, im_w, ref_size) {
+    let im_rh, im_rw;
 
-    status.value = 'Analysing...';
-
-    const { pixel_values } = await processor(image);
-    const { output } = await model({ input: pixel_values });
-
-    const mask = await RawImage.fromTensor(output[0].mul(255).to('uint8')).resize(image.width, image.height);
-
-    const ctx = canvas.value.getContext('2d');
-    canvas.value.width = image.width;
-    canvas.value.height = image.height;
-    ctx.drawImage(image.toCanvas(), 0, 0);
-
-    const pixelData = ctx.getImageData(0, 0, image.width, image.height);
-    for (let i = 0; i < mask.data.length; ++i) {
-        pixelData.data[4 * i + 3] = mask.data[i];
+    if (Math.max(im_h, im_w) < ref_size || Math.min(im_h, im_w) > ref_size) {
+        if (im_w >= im_h) {
+            im_rh = ref_size;
+            im_rw = Math.floor((im_w / im_h) * ref_size);
+        } else {
+            im_rw = ref_size;
+            im_rh = Math.floor((im_h / im_w) * ref_size);
+        }
+    } else {
+        im_rh = im_h;
+        im_rw = im_w;
     }
-    ctx.putImageData(pixelData, 0, 0);
 
+    im_rw = im_rw - (im_rw % 32);
+    im_rh = im_rh - (im_rh % 32);
+
+    const x_scale_factor = im_rw / im_w;
+    const y_scale_factor = im_rh / im_h;
+
+    return { x_scale_factor, y_scale_factor };
+}
+
+// Predict foreground of the given image
+const predict = async (imageFile) => {
+    const img = new Image();
+    img.src = imageFile;
+    await img.decode();
+
+    const { width: im_w, height: im_h } = img;
+
+    const ctx = canvasRef.value.getContext('2d');
+    canvasRef.value.width = im_w;
+    canvasRef.value.height = im_h;
+
+    status.value = 'Analyzing';
+
+    // Preprocessing image
+    const { x_scale_factor, y_scale_factor } = getScaleFactor(im_h, im_w, ref_size);
+    const resizedWidth = Math.floor(im_w * x_scale_factor);
+    const resizedHeight = Math.floor(im_h * y_scale_factor);
+    ctx.drawImage(img, 0, 0, resizedWidth, resizedHeight);
+    const rawImageData = ctx.getImageData(0, 0, resizedWidth, resizedHeight);
+    const resizedImage = new Float32Array((rawImageData.data.length / 4) * 3);
+
+    for (let i = 0, j = 0; i < rawImageData.data.length; i += 4, j += 3) {
+        resizedImage[j] = (rawImageData.data[i] - 127.5) / 127.5; // R
+        resizedImage[j + 1] = (rawImageData.data[i + 1] - 127.5) / 127.5; // G
+        resizedImage[j + 2] = (rawImageData.data[i + 2] - 127.5) / 127.5; // B
+    }
+
+    // Prepare input shape
+    let channels = 3; // Assuming RGB (3 channels)
+    let input = new Float32Array(1 * channels * resizedHeight * resizedWidth);
+
+    for (let c = 0; c < channels; c++) {
+        for (let h = 0; h < resizedHeight; h++) {
+            for (let w = 0; w < resizedWidth; w++) {
+                input[c * resizedHeight * resizedWidth + h * resizedWidth + w] =
+                    resizedImage[(h * resizedWidth + w) * channels + c];
+            }
+        }
+    }
+
+    // Load ONNX model and make predictions
+    const inputName = session.inputNames[0];
+    const outputName = session.outputNames[0];
+
+    const feeds = {};
+    feeds[inputName] = new ort.Tensor('float32', input, [1, 3, resizedHeight, resizedWidth]);
+
+    const results = await session.run(feeds);
+    const matteData = results[outputName].data;
+    console.log('info', im_w, im_h, resizedWidth, resizedHeight);
+
+    // Refine the matte and resize back to original size
+    const maskData = Float32Array.from(matteData, (v) => v * 255);
+
+    // Draw original image
+    ctx.drawImage(img, 0, 0, resizedWidth, resizedHeight);
+    const combineData = new ImageData(resizedWidth, resizedHeight);
+
+    console.log('rawImageData length:', rawImageData.data.length, 'mask:', maskData.length, 'combineData', combineData.data.length);
+
+    for (let i = 0; i < im_h; i++) {
+        for (let j = 0; j < im_w; j++) {
+            const index = i * im_w + j;
+            const alphaValue = maskData[index]; // 取单通道值
+
+            combineData.data[4 * index] = rawImageData.data[4 * index]; // R
+            combineData.data[4 * index + 1] = rawImageData.data[4 * index + 1]; // G
+            combineData.data[4 * index + 2] = rawImageData.data[4 * index + 2]; // B
+            combineData.data[4 * index + 3] = alphaValue; // alpha
+        }
+    }
+    canvasRef.value.width = im_w;
+    canvasRef.value.height = im_h;
+    ctx.putImageData(combineData, 0, 0);
     status.value = 'Done!';
 };
 </script>
